@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+
+# Environments
+.env
+.venv
+env/
+venv/
+.venv/
+
+# Datasets
+synthetic_data/
+
+# Models & Checkpoints
+gemma-3-4b-dpo/
+
