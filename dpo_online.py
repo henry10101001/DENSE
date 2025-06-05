@@ -12,45 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Usage:
-
-python examples/scripts/dpo_online.py \
-    --model_name_or_path trl-lib/pythia-1b-deduped-tldr-sft  \
-    --reward_model_path trl-lib/pythia-1b-deduped-tldr-rm \
-    --dataset_name trl-lib/tldr \
-    --learning_rate 5.0e-7 \
-    --output_dir gemma-3-4b-dpo \
-    --per_device_train_batch_size 8 \
-    --gradient_accumulation_steps 16 \
-    --warmup_ratio 0.1 \
-    --missing_eos_penalty 1.0
-
-With LoRA:
-python examples/scripts/dpo_online.py \
-    --model_name_or_path trl-lib/pythia-1b-deduped-tldr-sft  \
-    --reward_model_path trl-lib/pythia-1b-deduped-tldr-rm \
-    --dataset_name trl-lib/tldr \
-    --learning_rate 5.0e-6 \
-    --output_dir gemma-3-4b-dpo \
-    --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 8 \
-    --warmup_ratio 0.1 \
-    --missing_eos_penalty 1.0 \
-    --use_peft
-"""
-
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig
 
 from trl import (
     LogCompletionsCallback,
-    ModelConfig,
-    OnlineDPOConfig,
     OnlineDPOTrainer,
-    ScriptArguments,
-    TrlParser,
     get_kbit_device_map,
     get_peft_config,
     get_quantization_config,
@@ -58,19 +26,66 @@ from trl import (
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 from judge import DictionaryJudge, OpenAIJudge  # my custom judge implementations
 
+# global configuration variables
+MODEL = 'google/gemma-3-4b-it'
+REWARD_MODEL_PATH = None  # set to path if using reward model
+DATASET_NAME = 'trl-lib/tldr'
+DATASET_CONFIG = None
+DATASET_TRAIN_SPLIT = 'train'
+DATASET_TEST_SPLIT = 'test'
+OUTPUT_DIR = 'gemma-3-4b-dpo'
+LEARNING_RATE = 5.0e-7
+PER_DEVICE_TRAIN_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 16
+WARMUP_RATIO = 0.1
+MISSING_EOS_PENALTY = 1.0
+MAX_NEW_TOKENS = 512
+TEMPERATURE = 0.7
+EVAL_STRATEGY = 'steps'
+EVAL_STEPS = 500
+USE_PEFT = False
+JUDGE = None  # set to 'dictionary' or 'openai' if using judge
+PUSH_TO_HUB = False
+GRADIENT_CHECKPOINTING = True
 
 JUDGES = {"dictionary": DictionaryJudge, "openai": OpenAIJudge}
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, OnlineDPOConfig, ModelConfig))
-    script_args, training_args, model_args = parser.parse_args_and_config()  # parse command line arguments
-    training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}    # enable memory-efficient checkpointing
+    # create a simple config object to hold training arguments
+    class TrainingConfig:
+        def __init__(self):
+            self.reward_model_path = REWARD_MODEL_PATH
+            self.judge = JUDGE
+            self.gradient_checkpointing = GRADIENT_CHECKPOINTING
+            self.gradient_checkpointing_kwargs = {"use_reentrant": True}
+            self.eval_strategy = EVAL_STRATEGY
+            self.eval_steps = EVAL_STEPS
+            self.max_new_tokens = MAX_NEW_TOKENS
+            self.temperature = TEMPERATURE
+            self.output_dir = OUTPUT_DIR
+            self.push_to_hub = PUSH_TO_HUB
+            self.learning_rate = LEARNING_RATE
+            self.per_device_train_batch_size = PER_DEVICE_TRAIN_BATCH_SIZE
+            self.gradient_accumulation_steps = GRADIENT_ACCUMULATION_STEPS
+            self.warmup_ratio = WARMUP_RATIO
+            self.missing_eos_penalty = MISSING_EOS_PENALTY
+
+    class ModelConfig:
+        def __init__(self):
+            self.model_name_or_path = MODEL
+            self.model_revision = None
+            self.attn_implementation = None
+            self.torch_dtype = "auto"
+            self.trust_remote_code = True
+
+    training_args = TrainingConfig()
+    model_args = ModelConfig()
 
     # set up model dtype and quantization
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
     )
-    quantization_config = get_quantization_config(model_args)  # config model quantization (if specified)
+    quantization_config = get_quantization_config(model_args) if USE_PEFT else None  # config model quantization (if specified)
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -122,7 +137,7 @@ if __name__ == "__main__":
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token  # set pad token to eos token
 
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)  # load training dataset
+    dataset = load_dataset(DATASET_NAME, name=DATASET_CONFIG)  # load training dataset
 
     # create online DPO trainer
     trainer = OnlineDPOTrainer(
@@ -130,11 +145,11 @@ if __name__ == "__main__":
         reward_model=reward_model,
         judge=judge,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        train_dataset=dataset[DATASET_TRAIN_SPLIT],
+        eval_dataset=dataset[DATASET_TEST_SPLIT] if training_args.eval_strategy != "no" else None,
         processing_class=tokenizer,
         reward_processing_class=reward_tokenizer,
-        peft_config=get_peft_config(model_args),  # configure LoRA if specified
+        peft_config=get_peft_config(model_args) if USE_PEFT else None,  # configure LoRA if specified
     )
 
     # set up completion logging for evaluation
@@ -150,4 +165,4 @@ if __name__ == "__main__":
     # save trained model
     trainer.save_model(training_args.output_dir)
     if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)  # upload to hugging face hub
+        trainer.push_to_hub(dataset_name=DATASET_NAME)  # upload to hugging face hub

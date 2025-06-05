@@ -1,79 +1,25 @@
-import re
-import requests
-import openai
-from typing import List, Dict, Any
-from abc import ABC, abstractmethod
+from trl import BasePairwiseJudge
+from openai import OpenAI
 import math
+from typing import List
+import os
 
 
-class BaseJudge(ABC):
-    """Base class for all judges"""
-    
-    @abstractmethod
-    def judge(self, prompts: List[str], completions: List[List[str]], **kwargs) -> List[float]:
-        """
-        Judge the quality of completions for given prompts.
-        
-        Args:
-            prompts: List of input prompts
-            completions: List of completion lists (each prompt can have multiple completions)
-            
-        Returns:
-            List of scores (higher = better quality)
-        """
-        pass
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+JUDGE_MODEL = "gpt-4.1-mini-2025-04-14" # most recent snapshot as of 06/04/2025
 
 
-class LengthJudge(BaseJudge):
+class CustomJudge(BasePairwiseJudge):
     """
-    A simple judge that checks if the length of the completion is within a reasonable range. It awards points for shorter lengths, and penalizes longer lengths.
+    A pairwise judge that combines length-based scoring and OpenAI-based quality assessment
+    to determine which of two completions is better.
     """
     
-    def __init__(self):
-        pass
-    
-    def judge(self, prompts: List[str], completions: List[List[str]], **kwargs) -> List[float]:
-        scores = []
-        
-        for prompt, completion_list in zip(prompts, completions):
-            completion_scores = []
-            
-            for completion in completion_list:
-                score = self._score_completion(prompt, completion)
-                completion_scores.append(score)
-            
-            scores.extend(completion_scores)
-        
-        return scores
-    
-    def _score_completion(self, prompt: str, completion: str) -> float:
-        """Score a single completion"""
-        score = 0.0
-        
-        # Length scoring (0-1 points)
-        prompt_length = len(prompt.split())
-        completion_length = len(completion.split())
-        difference = prompt_length - completion_length # we want positive for shorter completions
-        
-        # score as a percentage of the length improvement
-        score += difference / prompt_length
-        
-        # normalize to -1 to 1 range
-        # use tanh to squash the score to [-1, 1] range
-        score = math.tanh(score)
-        
-        return score
-
-
-class OpenAIJudge(BaseJudge):
-    """
-    Uses OpenAI's gpt 4.1 nano to assess whether the completion maintains the same meaning as the prompt.
-    Also determines whether grammar and coherence are maintained.
-    """
-    
-    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini"):
-        self.client = openai.OpenAI(api_key=api_key) if api_key else None
+    def __init__(self, model: str = JUDGE_MODEL, length_weight: float = 0.3, quality_weight: float = 0.7):
+        self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.model = model
+        self.length_weight = length_weight
+        self.quality_weight = quality_weight
         
         self.judging_prompt = """
         You are a helpful assistant and a grammar and coherence expert that is tasked with assessing whether a response maintains the same meaning as the prompt.
@@ -108,43 +54,82 @@ class OpenAIJudge(BaseJudge):
         Please evaluate now, and respond with just the scores, no other text.
         """
     
-    def judge(self, prompts: List[str], completions: List[List[str]], **kwargs) -> List[float]:
-        scores = []
+    def judge(self, prompts, completions, shuffle_order=False):
+        """
+        Judge pairs of completions and return 0 or 1 indicating which completion is better.
+        Returns 0 if first completion is better, 1 if second completion is better.
+        """
+        results = []
         
-        for prompt, completion_list in zip(prompts, completions):
-            for completion in completion_list:
-                try:
-                    score = self._get_llm_score(prompt, completion)
-                    scores.append(score)
-                except Exception as e:
-                    print(f"Error getting LLM score: {e}")
-                    scores.append(0.0)  # Default score on error
+        for prompt, completion_pair in zip(prompts, completions):
+            completion_0, completion_1 = completion_pair
+            
+            # get scores for both completions
+            score_0 = self._score_completion(prompt, completion_0)
+            score_1 = self._score_completion(prompt, completion_1)
+            
+            # return 0 if first completion is better, 1 if second is better
+            results.append(0 if score_0 > score_1 else 1)
         
-        return scores
+        return results
     
-    def _get_llm_score(self, prompt: str, completion: str) -> float:
-        """Get score from OpenAI's gpt 4.1 nano"""
-        judge_prompt = self.judging_prompt.format(prompt=prompt, completion=completion)
+    def _score_completion(self, prompt: str, completion: str) -> float:
+        """Score a single completion using both length and quality metrics"""
+        # length scoring component
+        length_score = self._get_length_score(prompt, completion)
         
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": judge_prompt}],
-            max_tokens=50, # example is only ~30 tokens
-        )
+        # quality scoring component (using OpenAI API)
+        quality_score = self._get_quality_score(prompt, completion)
         
-        score_text = response.choices[0].message.content.strip()
+        # combine scores with weights
+        total_score = (self.length_weight * length_score) + (self.quality_weight * quality_score)
         
+        return total_score # should be between 0 and 1
+    
+    def _get_length_score(self, prompt: str, completion: str) -> float:
+        """Score based on length optimization (shorter is better)"""
+        prompt_length = len(prompt.split())
+        completion_length = len(completion.split())
+        difference = prompt_length - completion_length  # positive for shorter completions
+        
+        # score as a percentage of the length improvement
+        if prompt_length > 0:
+            score = difference / prompt_length
+        else:
+            score = 0.0
+        
+        # normalize to [0, 1] range using sigmoid
+        score = 1 / (1 + math.exp(-score))
+        
+        return score
+    
+    def _get_quality_score(self, prompt: str, completion: str) -> float:
+        """Get quality score from OpenAI assessment"""
         try:
-            meaning_score = float(score_text.split("MEANING_SCORE:")[1].split("\n")[0].strip())
-            coherence_score = float(score_text.split("COHERENCE_SCORE:")[1].split("\n")[0].strip())
-            grammar_score = float(score_text.split("GRAMMAR_SCORE:")[1].split("\n")[0].strip())
+            judge_prompt = self.judging_prompt.format(prompt=prompt, completion=completion)
             
-            # clamp to 0-1 range
-            meaning_score = max(0.0, min(1.0, meaning_score))
-            coherence_score = max(0.0, min(1.0, coherence_score))
-            grammar_score = max(0.0, min(1.0, grammar_score))
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": judge_prompt}],
+                max_completion_tokens=50,  # example is only ~30 tokens
+            )
             
-            # return the average of the scores
-            return (meaning_score + coherence_score + grammar_score) / 3.0
-        except ValueError:
-            return 0.0 # default score on error with parsing
+            score_text = response.choices[0].message.content.strip()
+            
+            try:
+                meaning_score = float(score_text.split("MEANING_SCORE:")[1].split("\n")[0].strip())
+                coherence_score = float(score_text.split("COHERENCE_SCORE:")[1].split("\n")[0].strip())
+                grammar_score = float(score_text.split("GRAMMAR_SCORE:")[1].split("\n")[0].strip())
+                
+                # clamp to 0-1 range
+                meaning_score = max(0.0, min(1.0, meaning_score))
+                coherence_score = max(0.0, min(1.0, coherence_score))
+                grammar_score = max(0.0, min(1.0, grammar_score))
+                
+                # return the average of the scores
+                return (meaning_score + coherence_score + grammar_score) / 3.0
+            except (ValueError, IndexError):
+                return 0.5  # neutral score on parsing error
+        except Exception as e:
+            print(f"Error getting quality score: {e}")
+            return 0.5  # neutral score on error
