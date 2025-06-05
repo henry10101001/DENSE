@@ -14,3 +14,4 @@ trainer = OnlineDPOTrainer(
     model=model, judge=judge, args=training_args, processing_class=tokenizer, train_dataset=train_dataset
 )
 trainer.train()
+trainer.save_model(training_args.output_dir)
